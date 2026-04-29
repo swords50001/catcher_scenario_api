@@ -95,8 +95,11 @@ class PredictResponse(BaseModel):
     top_pitch:         str
     top_probability:   float
     selected_pitch:    Optional[str]
-    confidence_score:  Optional[float]   # probability of the selected pitch
-    confidence_label:  Optional[str]     # "High / Medium / Low"
+    confidence_score:  Optional[float]
+    confidence_label:  Optional[str]
+    verdict:           Optional[str]    # "Correct" / "Acceptable" / "Incorrect"
+    verdict_emoji:     Optional[str]    # ✅ / ⚠️ / ❌
+    verdict_reason:    Optional[str]    # plain english explanation
     situation_summary: str
 
 
@@ -155,6 +158,46 @@ def confidence_label(score: float) -> str:
     if score >= 0.55:   return "High"
     if score >= 0.35:   return "Medium"
     return "Low"
+
+
+def get_verdict(selected_pitch: str,
+                top_pitch: str,
+                selected_prob: float,
+                top_prob: float,
+                sorted_probs: list) -> tuple:
+    """
+    Verdict logic:
+    - Correct   → selected pitch IS the top predicted pitch
+    - Acceptable → selected pitch is within 10% of the top pitch probability
+    - Incorrect  → selected pitch is well below the top prediction
+    """
+    # Get rank of selected pitch (1 = best)
+    ranked = [p for p, _ in sorted_probs]
+    selected_rank = ranked.index(selected_pitch) + 1
+    prob_gap = top_prob - selected_prob
+
+    if selected_pitch == top_pitch:
+        return (
+            "Correct",
+            "✅",
+            f"{selected_pitch} is the model's top pick for this situation "
+            f"at {selected_prob*100:.0f}% probability."
+        )
+    elif selected_rank == 2 or prob_gap <= 0.10:
+        return (
+            "Acceptable",
+            "⚠️",
+            f"{selected_pitch} is a reasonable call ({selected_prob*100:.0f}%), "
+            f"though {top_pitch} is slightly more likely at {top_prob*100:.0f}%."
+        )
+    else:
+        return (
+            "Incorrect",
+            "❌",
+            f"{selected_pitch} is unlikely here ({selected_prob*100:.0f}%). "
+            f"The model strongly favors {top_pitch} at {top_prob*100:.0f}% "
+            f"for this situation."
+        )
 
 
 def situation_summary(req: PitchRequest) -> str:
@@ -244,6 +287,17 @@ def predict(req: PitchRequest):
         conf_score = round(float(prob_map[req.selected_pitch]), 4)
         conf_label = confidence_label(conf_score)
 
+    # Verdict
+    verdict, verdict_emoji, verdict_reason = (None, None, None)
+    if req.selected_pitch:
+        verdict, verdict_emoji, verdict_reason = get_verdict(
+            selected_pitch = req.selected_pitch,
+            top_pitch      = top_pitch,
+            selected_prob  = float(prob_map[req.selected_pitch]),
+            top_prob       = float(top_prob),
+            sorted_probs   = sorted_probs,
+        )
+
     return PredictResponse(
         probabilities     = probabilities,
         top_pitch         = top_pitch,
@@ -251,7 +305,11 @@ def predict(req: PitchRequest):
         selected_pitch    = req.selected_pitch,
         confidence_score  = conf_score,
         confidence_label  = conf_label,
+        verdict           = verdict,
+        verdict_emoji     = verdict_emoji,
+        verdict_reason    = verdict_reason,
         situation_summary = situation_summary(req),
+    )
     )
 
 
