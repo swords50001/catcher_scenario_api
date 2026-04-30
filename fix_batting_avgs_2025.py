@@ -25,6 +25,7 @@ ba = ba[["Name", "BA"]].rename(columns={"BA": "batter_avg"})
 ba["batter_avg"] = pd.to_numeric(ba["batter_avg"], errors="coerce")
 ba = ba.dropna(subset=["batter_avg"])
 ba = ba[ba["batter_avg"] > 0]
+ba = ba.groupby("Name")["batter_avg"].mean().reset_index()
 
 print(f"   ✅ {len(ba)} batters with valid BA.")
 
