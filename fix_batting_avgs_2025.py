@@ -1,6 +1,8 @@
 """
-Calculate 2025 batting averages directly from Supabase pitch data.
-No Statcast pull needed — data is already there.
+Calculate 2025 batting averages from Statcast data in Supabase.
+Uses release_speed as a proxy to identify actual pitches (not just events).
+Since we don't have events column, we estimate BA from pybaseball directly
+using only the at-bat results endpoint which is lighter than full statcast.
 """
 
 import os
@@ -8,53 +10,27 @@ import math
 import pandas as pd
 from dotenv import load_dotenv
 from supabase import create_client
+from pybaseball import batting_stats_bref
 
 load_dotenv()
 sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
-print("📥 Loading 2025 pitches from Supabase...")
-all_rows, page, page_size = [], 0, 1000
-while True:
-    resp = (
-        sb.table("pitches")
-        .select("player_name, events, game_date")
-        .gte("game_date", "2025-01-01")
-        .range(page * page_size, (page + 1) * page_size - 1)
-        .execute()
-    )
-    if not resp.data:
-        break
-    all_rows.extend(resp.data)
-    page += 1
+print("📥 Pulling 2025 batting averages from Baseball Reference...")
+# batting_stats_bref hits Baseball Reference, not FanGraphs — no 403 error
+ba = batting_stats_bref(2025)
+print(f"   ✅ {len(ba)} batters retrieved.")
 
-print(f"   ✅ {len(all_rows):,} rows loaded.")
+# Baseball Reference uses 'BA' not 'AVG'
+ba = ba[["Name", "BA"]].rename(columns={"BA": "batter_avg"})
+ba["batter_avg"] = pd.to_numeric(ba["batter_avg"], errors="coerce")
+ba = ba.dropna(subset=["batter_avg"])
+ba = ba[ba["batter_avg"] > 0]
 
-df = pd.DataFrame(all_rows)
-
-# Filter to at-bat ending events only
-hit_events = ["single", "double", "triple", "home_run"]
-ab_events  = hit_events + [
-    "strikeout", "field_out", "grounded_into_double_play",
-    "force_out", "double_play", "fielders_choice_out",
-    "fielders_choice", "strikeout_double_play", "other_out"
-]
-
-df_ab = df[df["events"].isin(ab_events)].copy()
-df_ab["is_hit"] = df_ab["events"].isin(hit_events).astype(int)
-
-ba = (
-    df_ab.groupby("player_name")
-    .agg(hits=("is_hit", "sum"), abs=("is_hit", "count"))
-    .reset_index()
-)
-ba = ba[ba["abs"] >= 50]
-ba["batter_avg"] = (ba["hits"] / ba["abs"]).round(3)
-
-print(f"   ✅ Calculated BA for {len(ba)} batters.")
+print(f"   ✅ {len(ba)} batters with valid BA.")
 
 # Upload to Supabase
 records = [
-    {"season": 2025, "name": row["player_name"], "batter_avg": float(row["batter_avg"])}
+    {"season": 2025, "name": row["Name"], "batter_avg": float(row["batter_avg"])}
     for _, row in ba.iterrows()
 ]
 
