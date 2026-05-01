@@ -97,10 +97,17 @@ class PitchRequest(BaseModel):
     )
 
 
+class LocationProbability(BaseModel):
+    location_zone: str
+    probability:   float
+
+
 class PitchProbability(BaseModel):
-    pitch_type:  str
-    probability: float
-    is_selected: bool
+    pitch_type:             str
+    probability:            float
+    is_selected:            bool
+    location_probabilities: list[LocationProbability]
+    most_likely_location:   str
 
 
 class PredictResponse(BaseModel):
@@ -310,14 +317,54 @@ def predict(req: PitchRequest):
     prob_map     = dict(zip(PITCH_CLASSES, probs_arr))
     sorted_probs = sorted(prob_map.items(), key=lambda x: x[1], reverse=True)
 
-    probabilities = [
-        PitchProbability(
-            pitch_type  = p,
-            probability = round(float(v), 4),
-            is_selected = (p == req.selected_pitch),
+    # Build a (9 zones × num_pitch_types) matrix of P(pitch_type | situation, zone)
+    # by re-running the model with location_zone swapped to each of the 9 zones.
+    # Then for each pitch type, normalize across zones to get
+    # P(zone | pitch_type, situation) under a uniform prior over zones.
+    zone_request_dicts = []
+    base_dict = req.model_dump()
+    for zone in LOCATION_ZONES:
+        d = dict(base_dict)
+        d["location_zone"] = zone
+        zone_request_dicts.append(PitchRequest(**d))
+
+    zone_X     = pd.concat(
+        [build_feature_row(zr) for zr in zone_request_dicts],
+        ignore_index=True,
+    )
+    zone_probs = model.predict_proba(zone_X)  # shape: (9, num_pitch_types)
+
+    # Per-pitch location distributions (cols = pitch types, rows = zones)
+    pitch_to_zone_probs: dict = {}
+    for pitch_idx, pitch_name in enumerate(PITCH_CLASSES):
+        col = zone_probs[:, pitch_idx]
+        total = float(col.sum())
+        if total > 0:
+            normalized = col / total
+        else:
+            normalized = np.full_like(col, 1.0 / len(LOCATION_ZONES))
+        pitch_to_zone_probs[pitch_name] = normalized
+
+    probabilities = []
+    for p, v in sorted_probs:
+        zone_dist = pitch_to_zone_probs[p]
+        loc_probs = [
+            LocationProbability(
+                location_zone = zone,
+                probability   = round(float(zone_dist[i]), 4),
+            )
+            for i, zone in enumerate(LOCATION_ZONES)
+        ]
+        most_likely_zone = LOCATION_ZONES[int(np.argmax(zone_dist))]
+        probabilities.append(
+            PitchProbability(
+                pitch_type             = p,
+                probability            = round(float(v), 4),
+                is_selected            = (p == req.selected_pitch),
+                location_probabilities = loc_probs,
+                most_likely_location   = most_likely_zone,
+            )
         )
-        for p, v in sorted_probs
-    ]
 
     top_pitch, top_prob = sorted_probs[0]
 
