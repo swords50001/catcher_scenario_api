@@ -129,41 +129,55 @@ def clean_pitch_data(df: pd.DataFrame) -> pd.DataFrame:
 
 # ─── Location zone helper ────────────────────────────────────────────────────
 
+# Strike-zone outer edges. No per-batter sz_top/sz_bot in the data yet, so we
+# use league-average bounds (tunable). A pitch beyond any of these is out of zone.
+ZONE_X_EDGE = 0.83   # |plate_x| ft beyond this is off the plate horizontally
+ZONE_Z_TOP  = 3.5    # ft — top of the zone
+ZONE_Z_BOT  = 1.5    # ft — bottom of the zone
+ZONE_Z_MID  = 2.5    # ft — splits out-of-zone pitches into up/low halves
+
+
 def get_location_zone(plate_x: float, plate_z: float, stand: str) -> str:
     """
-    Map plate_x / plate_z coordinates to a 9-zone grid.
-    Statcast coords: plate_x is horizontal (-ve = catcher's left / inside to RHH)
-                     plate_z is vertical (roughly 1.5 = low, 3.5 = high)
+    Map plate_x / plate_z coordinates to a batter-relative location zone.
 
-    Zones flip horizontally for LHH so in/out stay batter-relative.
+    In-zone: the original 3x3 grid (up/middle/low x in/middle/away).
+    Out-of-zone: four corner quadrants (out_{up,low}_{in,away}) for pitches
+    beyond the strike-zone edge. These used to be silently lumped into the
+    nearest in-zone third because the grid had no outer boundary.
 
-    RHH view:                    LHH view (mirrored):
-    up_in | up_middle | up_away  up_away | up_middle | up_in
-    middle_in | ... | middle_away         ...flipped...
-    low_in | low_middle | low_away low_away | low_middle | low_in
+    Statcast coords: plate_x horizontal (-ve = catcher's left / inside to RHH),
+    plate_z vertical (~1.5 low, ~3.5 high). Horizontal axis flips for LHH so
+    in/away stay batter-relative.
     """
-    # Vertical zones
+    # Batter-relative horizontal coordinate (negative = inside).
+    x = -plate_x if stand == "L" else plate_x
+
+    # Out of the zone beyond any edge → corner quadrant.
+    if x < -ZONE_X_EDGE or x > ZONE_X_EDGE or plate_z > ZONE_Z_TOP or plate_z < ZONE_Z_BOT:
+        v_part = "up" if plate_z >= ZONE_Z_MID else "low"
+        h_part = "in" if x < 0 else "away"
+        return f"out_{v_part}_{h_part}"
+
+    # In-zone 3x3 thirds (unchanged behaviour).
     if plate_z >= 3.0:      v_zone = "up"
     elif plate_z >= 2.0:    v_zone = "middle"
     else:                   v_zone = "low"
 
-    # Horizontal zones — flip for lefties so in/out stay batter-relative
-    # For RHH: negative plate_x = inside, positive = outside
-    # For LHH: positive plate_x = inside, negative = outside
-    if stand == "L":
-        plate_x = -plate_x
-
-    if plate_x <= -0.7:     h_zone = "in"
-    elif plate_x >= 0.7:    h_zone = "away"
+    if x <= -0.7:           h_zone = "in"
+    elif x >= 0.7:          h_zone = "away"
     else:                   h_zone = "middle"
 
     return f"{v_zone}_{h_zone}"
 
 
 LOCATION_ZONES = [
+    # In-zone 3x3 grid
     "up_in",      "up_middle",      "up_away",
     "middle_in",  "middle_middle",  "middle_away",
     "low_in",     "low_middle",     "low_away",
+    # Out-of-zone corners (batter-relative). Must match api.py's LOCATION_ZONES.
+    "out_up_in",  "out_up_away",    "out_low_in",  "out_low_away",
 ]
 
 
@@ -293,10 +307,11 @@ BASE_FEATURES = [
     "pitcher_tends_Fastball", "pitcher_tends_Sinker",  "pitcher_tends_Slider",
     "pitcher_tends_Changeup", "pitcher_tends_Curveball","pitcher_tends_Cutter",
     "pitcher_tends_Splitter", "pitcher_tends_Sweeper",
-    # Location zones
-    "loc_up_in",     "loc_up_middle",     "loc_up_away",
-    "loc_middle_in", "loc_middle_middle", "loc_middle_away",
-    "loc_low_in",    "loc_low_middle",    "loc_low_away",
+    # Location zones (in-zone 3x3 + out-of-zone corners)
+    "loc_up_in",      "loc_up_middle",     "loc_up_away",
+    "loc_middle_in",  "loc_middle_middle", "loc_middle_away",
+    "loc_low_in",     "loc_low_middle",    "loc_low_away",
+    "loc_out_up_in",  "loc_out_up_away",   "loc_out_low_in", "loc_out_low_away",
 ]
 
 CAT_FEATURES = ["count_category", "batter_avg_bucket"]
