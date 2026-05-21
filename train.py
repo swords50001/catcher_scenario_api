@@ -34,22 +34,29 @@ def load_from_supabase() -> pd.DataFrame:
     sb  = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
     
     print("📥 Loading pitches from Supabase ...")
-    # Paginate — Supabase returns max 1000 rows per call
-    all_rows, page, page_size = [], 0, 1000
+    # Keyset (cursor) pagination on the primary key. The old approach paged with
+    # .range()/OFFSET, which forces Postgres to scan and discard every prior row
+    # on each page — on a 2M-row table the deep pages exceed the statement
+    # timeout (APIError 57014). Filtering `id > last_id` with an ORDER BY id uses
+    # the PK index, so every page is fast regardless of depth.
+    all_rows, page_size, last_id = [], 1000, 0
     while True:
         resp = (
             sb.table("pitches")
             .select("*")
-            .range(page * page_size, (page + 1) * page_size - 1)
+            .gt("id", last_id)
+            .order("id", desc=False)
+            .limit(page_size)
             .execute()
         )
         rows = resp.data
         if not rows:
             break
         all_rows.extend(rows)
-        page += 1
+        last_id = rows[-1]["id"]
+        print(f"   ... {len(all_rows):,} rows loaded", end="\r")
     df = pd.DataFrame(all_rows)
-    print(f"   ✅ {len(df):,} pitches loaded.\n")
+    print(f"\n   ✅ {len(df):,} pitches loaded.\n")
 
     print("📥 Loading batting averages from Supabase ...")
     ba_resp = sb.table("batters").select("name, batter_avg").execute()
