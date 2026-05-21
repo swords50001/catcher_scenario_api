@@ -17,7 +17,7 @@ pytest.importorskip("supabase")
 import numpy as np
 import pandas as pd
 
-from train import clean_pitch_data, NATURAL_KEY
+from train import clean_pitch_data, NATURAL_KEY, get_location_zone, LOCATION_ZONES
 
 
 def _row(game_pk, ab, pitch, plate_x, plate_z, pitch_label="Fastball"):
@@ -98,3 +98,37 @@ def test_dedupe_skipped_gracefully_without_key_columns():
     ])
     clean = clean_pitch_data(df)
     assert len(clean) == 1
+
+
+# ── get_location_zone: out-of-zone taxonomy ──────────────────────────────────
+
+class TestLocationZone:
+    def test_in_zone_unchanged(self):
+        # Dead center, and a near-edge in-zone pitch, classify as before.
+        assert get_location_zone(0.0, 2.5, "R") == "middle_middle"
+        assert get_location_zone(0.75, 3.2, "R") == "up_away"
+        assert get_location_zone(-0.75, 1.8, "R") == "low_in"
+
+    def test_out_horizontal_rhh(self):
+        # Way off the plate horizontally (RHH): inside vs away corners.
+        assert get_location_zone(1.5, 2.6, "R") == "out_up_away"   # high & off-away
+        assert get_location_zone(-1.5, 2.0, "R") == "out_low_in"   # low & off-inside
+
+    def test_out_vertical(self):
+        # Above the top / below the bottom of the zone, over the middle.
+        assert get_location_zone(0.0, 4.0, "R") == "out_up_away"   # x==0 → away by convention
+        assert get_location_zone(-0.1, 1.0, "R") == "out_low_in"   # slightly inside, in dirt
+
+    def test_lefty_horizontal_flip(self):
+        # plate_x = +1.5 is INSIDE to a lefty, so it must read as *_in, not *_away.
+        assert get_location_zone(1.5, 2.6, "L") == "out_up_in"
+
+    def test_all_returned_zones_are_known(self):
+        for px in (-2.0, -0.8, -0.5, 0.0, 0.5, 0.8, 2.0):
+            for pz in (0.8, 1.6, 2.5, 3.4, 4.2):
+                for stand in ("L", "R"):
+                    assert get_location_zone(px, pz, stand) in LOCATION_ZONES
+
+    def test_taxonomy_has_thirteen_zones(self):
+        assert len(LOCATION_ZONES) == 13
+        assert sum(z.startswith("out_") for z in LOCATION_ZONES) == 4

@@ -38,10 +38,17 @@ feature_cols = joblib.load(FEATURES_PATH)
 PITCH_CLASSES = list(label_enc.classes_)
 
 LOCATION_ZONES = [
-    "up_in",     "up_middle",     "up_away",
-    "middle_in", "middle_middle", "middle_away",
-    "low_in",    "low_middle",    "low_away",
+    # In-zone 3x3 grid
+    "up_in",       "up_middle",     "up_away",
+    "middle_in",   "middle_middle", "middle_away",
+    "low_in",      "low_middle",    "low_away",
+    # Out-of-zone corners (batter-relative). Must match train.py's LOCATION_ZONES.
+    "out_up_in",   "out_up_away",   "out_low_in",   "out_low_away",
 ]
+
+# Zones outside the strike zone — governed by the chase model, not the in-zone
+# quality→weights layers.
+OUT_OF_ZONE_ZONES = {"out_up_in", "out_up_away", "out_low_in", "out_low_away"}
 
 # ─── App setup ──────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -678,7 +685,17 @@ def compute_pitch_quality(
     # cap context_s to declared range
     context_s = max(-0.05, min(0.05, context_s))
 
-    raw = base + rank_s + gap_s + verdict_s + entropy_s + context_s
+    # Count-aware out-of-zone intent (docs/out-of-zone-chase-model.md §9):
+    # a chase pitch with two strikes is smart pitching; wasting one while ahead
+    # in the count is not. Keeps quality consistent with the chase outcome model.
+    intent_s = 0.0
+    if selection.location in OUT_OF_ZONE_ZONES:
+        if scenario.strikes == 2 and scenario.balls < 3:
+            intent_s += 0.03      # 0-2, 1-2, 2-2 — expand the zone, get the chase
+        elif (scenario.balls, scenario.strikes) in {(2, 0), (3, 0), (3, 1)}:
+            intent_s -= 0.04      # ahead in the count — wasting a pitch / risking a walk
+
+    raw = base + rank_s + gap_s + verdict_s + entropy_s + context_s + intent_s
     score = max(0.0, min(1.0, raw))
     return score, quality_tier(score)
 
@@ -941,6 +958,84 @@ def _bases_advanced(o: str) -> int:
             "walk": 1, "hit_by_pitch": 1}.get(o, 0)
 
 
+# ─── Out-of-zone chase model (see docs/out-of-zone-chase-model.md) ──────────
+#
+# Pitches thrown OUTSIDE the strike zone are governed by the batter's swing
+# decision (take → ball, chase → whiff/weak contact), not by pitch-quality
+# weight nudges. All constants below are league-average calibration anchors and
+# are meant to be tuned (ideally against your own Statcast description/events).
+
+# Each out-of-zone zone maps to a depth band. With a single directional ring we
+# only distinguish "chase" today; shadow/waste granularity needs continuous
+# coordinates (pending the UI input model) or a second outer ring.
+ZONE_DEPTH = {
+    "out_up_in":    "chase",
+    "out_up_away":  "chase",
+    "out_low_in":   "chase",
+    "out_low_away": "chase",
+}
+
+BASE_SWING = {"shadow": 0.55, "chase": 0.22, "waste": 0.05}
+
+COUNT_SWING_FACTOR = {
+    (0, 0): 0.85, (0, 1): 1.00, (0, 2): 1.45,
+    (1, 0): 0.80, (1, 1): 1.00, (1, 2): 1.45,
+    (2, 0): 0.55, (2, 1): 0.80, (2, 2): 1.40,
+    (3, 0): 0.20, (3, 1): 0.55, (3, 2): 1.35,
+}
+
+WHIFF_GIVEN_SWING        = {"shadow": 0.25, "chase": 0.42, "waste": 0.62}
+CALLED_STRIKE_GIVEN_TAKE = {"shadow": 0.45, "chase": 0.05, "waste": 0.00}
+
+WEAK_CONTACT_DIST = {
+    "foul_ball": 0.500, "ground_out": 0.200, "pop_out": 0.120,
+    "fly_out":   0.060, "line_out":   0.020, "single":  0.085,
+    "double":    0.012, "triple":     0.001, "home_run": 0.002,
+}
+
+
+def _is_out_of_zone(location: str) -> bool:
+    return location in OUT_OF_ZONE_ZONES
+
+
+def _zone_depth(location: str) -> str:
+    return ZONE_DEPTH.get(location, "chase")
+
+
+def out_of_zone_outcome_weights(
+    zone_depth:    str,
+    balls:         int,
+    strikes:       int,
+    discipline:    float = 1.0,
+    quality_score: Optional[float] = None,
+) -> dict[str, float]:
+    """Outcome weights for a pitch thrown OUTSIDE the strike zone.
+
+    Two-stage swing/take model (docs/out-of-zone-chase-model.md §3–5). Returns
+    weights over the standard outcome vocabulary BEFORE the count-remap step;
+    the four branches already sum to 1.0.
+    """
+    s = BASE_SWING[zone_depth] * COUNT_SWING_FACTOR[(balls, strikes)] * discipline
+    s = max(0.02, min(0.95, s))
+
+    whiff = WHIFF_GIVEN_SWING[zone_depth]
+    if quality_score is not None:
+        # A well-executed chase pitch misses more bats: ±10% at the extremes.
+        whiff = max(0.0, min(0.95, whiff * (0.9 + 0.2 * quality_score)))
+
+    cs = CALLED_STRIKE_GIVEN_TAKE[zone_depth]
+
+    weights: dict[str, float] = {
+        "swinging_strike": s * whiff,
+        "called_strike":   (1.0 - s) * cs,
+        "ball":            (1.0 - s) * (1.0 - cs),
+    }
+    contact_mass = s * (1.0 - whiff)
+    for outcome, share in WEAK_CONTACT_DIST.items():
+        weights[outcome] = weights.get(outcome, 0.0) + contact_mass * share
+    return weights
+
+
 def resolve_outcome(
     quality_score: float,
     quality_tier_label: str,
@@ -953,13 +1048,29 @@ def resolve_outcome(
     batter_avg:    float,
     rng:           random.Random,
 ) -> OutcomeBlock:
-    """Implements the 6-layer weighted-sample model from audit §2.3."""
-    w = _base_outcome_weights(quality_score)
-    _apply_count_modifiers(w, balls, strikes, quality_score)
-    _apply_location_modifiers(w, location)
-    _apply_batter_modifiers(w, batter_avg, quality_score)
-    _apply_runner_modifiers(w, runners, outs)
-    _apply_elite_rule(w, quality_tier_label)
+    """Weighted-sample outcome model.
+
+    In-zone pitches use the 6-layer model from audit §2.3. Out-of-zone pitches
+    route through the chase model instead (docs/out-of-zone-chase-model.md).
+    """
+    if _is_out_of_zone(location):
+        w = out_of_zone_outcome_weights(
+            zone_depth    = _zone_depth(location),
+            balls         = balls,
+            strikes       = strikes,
+            discipline    = 1.0,            # league-average until a chase stat exists
+            quality_score = quality_score,  # well-executed chase = nastier
+        )
+        _apply_runner_modifiers(w, runners, outs)
+        # NOTE: deliberately skip _apply_elite_rule here. A chase pitch is a ball
+        # by design when taken; zeroing the ball weight would break the mechanic.
+    else:
+        w = _base_outcome_weights(quality_score)
+        _apply_count_modifiers(w, balls, strikes, quality_score)
+        _apply_location_modifiers(w, location)
+        _apply_batter_modifiers(w, batter_avg, quality_score)
+        _apply_runner_modifiers(w, runners, outs)
+        _apply_elite_rule(w, quality_tier_label)
 
     # Map count-conditional outcomes:
     # - On the 3rd strike, called/swinging strike become strikeouts.

@@ -25,6 +25,8 @@ from api import (
     compute_situation_tags, coach_hint_for_tags, COACH_HINTS,
     _gap_score, _rank_score, _verdict_modifier, _normalized_entropy,
     _base_outcome_weights, ALL_OUTCOMES,
+    out_of_zone_outcome_weights, _is_out_of_zone, _zone_depth,
+    OUT_OF_ZONE_ZONES,
 )
 
 
@@ -430,6 +432,131 @@ class TestCoachHints:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Out-of-zone chase model
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestZoneClassification:
+    def test_out_of_zone_set(self):
+        assert _is_out_of_zone("out_low_away")
+        assert not _is_out_of_zone("low_away")
+        assert OUT_OF_ZONE_ZONES == {
+            "out_up_in", "out_up_away", "out_low_in", "out_low_away"
+        }
+
+    def test_zone_depth_defaults_to_chase(self):
+        assert _zone_depth("out_low_away") == "chase"
+        assert _zone_depth("anything_unknown") == "chase"
+
+
+class TestOutOfZoneWeights:
+    def test_distribution_sums_to_one(self):
+        for depth in ("shadow", "chase", "waste"):
+            for b in range(4):
+                for s in range(3):
+                    w = out_of_zone_outcome_weights(depth, b, s)
+                    assert sum(w.values()) == pytest.approx(1.0, abs=1e-9)
+
+    def test_ball_rate_rises_with_depth(self):
+        # Same count, further out of zone → more balls (less swinging).
+        shadow = out_of_zone_outcome_weights("shadow", 1, 1)["ball"]
+        chase  = out_of_zone_outcome_weights("chase", 1, 1)["ball"]
+        waste  = out_of_zone_outcome_weights("waste", 1, 1)["ball"]
+        assert shadow < chase < waste
+
+    def test_three_oh_is_almost_all_ball(self):
+        # Nobody chases 3-0 — it's a ball the overwhelming majority of the time.
+        w = out_of_zone_outcome_weights("chase", 3, 0)
+        assert w["ball"] > 0.85
+
+    def test_two_strikes_more_whiffs_than_three_oh(self):
+        protect = out_of_zone_outcome_weights("chase", 0, 2)["swinging_strike"]
+        ahead   = out_of_zone_outcome_weights("chase", 3, 0)["swinging_strike"]
+        assert protect > ahead
+
+    def test_power_is_near_zero(self):
+        w = out_of_zone_outcome_weights("chase", 0, 0)
+        assert w["home_run"] < 0.005
+
+    def test_quality_scaling_raises_whiff(self):
+        low_q  = out_of_zone_outcome_weights("chase", 0, 2, quality_score=0.0)
+        high_q = out_of_zone_outcome_weights("chase", 0, 2, quality_score=1.0)
+        assert high_q["swinging_strike"] > low_q["swinging_strike"]
+
+
+class TestOutOfZoneResolveOutcome:
+    def test_elite_pitch_out_of_zone_CAN_be_a_ball(self):
+        # In-zone elite pitches never go ball (Layer 6). Out-of-zone, the elite
+        # rule is skipped — a taken chase pitch is a ball by design.
+        saw_ball = False
+        for seed in range(80):
+            out = resolve_outcome(
+                quality_score=0.90, quality_tier_label="elite",
+                pitch_type="Slider", location="out_low_away",
+                balls=1, strikes=0, outs=0, runners=[], batter_avg=0.260,
+                rng=random.Random(seed),
+            )
+            if out.result == "ball":
+                saw_ball = True
+                break
+        assert saw_ball, "out-of-zone elite pitch should still be able to be a ball"
+
+    def test_three_oh_out_of_zone_mostly_walks(self):
+        results = [
+            resolve_outcome(
+                quality_score=0.5, quality_tier_label="good",
+                pitch_type="Fastball", location="out_up_away",
+                balls=3, strikes=0, outs=0, runners=[], batter_avg=0.26,
+                rng=random.Random(s),
+            ).result
+            for s in range(120)
+        ]
+        # balls==3, so a ball becomes a walk. Hitters take 3-0 chase pitches.
+        assert sum(r == "walk" for r in results) > 90
+
+    def test_outcome_is_valid_and_seeded(self):
+        a = resolve_outcome(
+            quality_score=0.6, quality_tier_label="good",
+            pitch_type="Slider", location="out_low_away",
+            balls=0, strikes=2, outs=1, runners=[1], batter_avg=0.27,
+            rng=random.Random(99),
+        )
+        b = resolve_outcome(
+            quality_score=0.6, quality_tier_label="good",
+            pitch_type="Slider", location="out_low_away",
+            balls=0, strikes=2, outs=1, runners=[1], batter_avg=0.27,
+            rng=random.Random(99),
+        )
+        assert a.result in ALL_OUTCOMES
+        assert a.result == b.result
+
+
+class TestQualityIntent:
+    def _q(self, scenario, selection):
+        probs = [("Slider", 0.40), ("Fastball", 0.30),
+                 ("Curveball", 0.20), ("Changeup", 0.10)]
+        return compute_pitch_quality(probs, "Slider", "Correct", scenario, selection)[0]
+
+    def test_out_of_zone_two_strike_beats_three_oh(self):
+        sel = EvaluateSelection(pitch_type="Slider", location="out_low_away")
+        two_strike = EvaluateScenario(balls=0, strikes=2, outs=1, inning=4,
+                                      runners_on_base=[], batter_avg=0.26)
+        three_oh = EvaluateScenario(balls=3, strikes=0, outs=1, inning=4,
+                                    runners_on_base=[], batter_avg=0.26)
+        assert self._q(two_strike, sel) > self._q(three_oh, sel)
+
+    def test_in_zone_unaffected_by_intent(self):
+        # In-zone selection should get no out-of-zone intent adjustment.
+        in_zone = EvaluateSelection(pitch_type="Slider", location="low_away")
+        s2 = EvaluateScenario(balls=0, strikes=2, outs=1, inning=4,
+                              runners_on_base=[], batter_avg=0.26)
+        s30 = EvaluateScenario(balls=3, strikes=0, outs=1, inning=4,
+                               runners_on_base=[], batter_avg=0.26)
+        # Counts still differ via existing modifiers, but neither gets the
+        # ±0.03/0.04 out-of-zone intent term — so they stay close.
+        assert abs(self._q(s2, in_zone) - self._q(s30, in_zone)) < 0.03
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # /api/v1/evaluate end-to-end
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -527,3 +654,21 @@ class TestEvaluateEndpoint:
         assert r.status_code == 200, r.text
         assert "probabilities" in r.json()
         assert "top_pitch" in r.json()
+
+    def test_out_of_zone_location_accepted(self, client):
+        # An out-of-zone target is now a valid location and yields a real outcome.
+        payload = self._payload()
+        payload["selection"]["location"] = "out_low_away"
+        r = client.post("/api/v1/evaluate", json=payload)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["outcome"]["result"] in ALL_OUTCOMES
+
+    def test_out_of_zone_three_oh_walks_through_api(self, client):
+        # 3-0 chase pitch through the full endpoint should resolve to a walk
+        # (deterministic via the seed in the payload context).
+        payload = self._payload(balls=3, strikes=0)
+        payload["selection"]["location"] = "out_up_away"
+        r = client.post("/api/v1/evaluate", json=payload)
+        assert r.status_code == 200, r.text
+        assert r.json()["outcome"]["result"] == "walk"
