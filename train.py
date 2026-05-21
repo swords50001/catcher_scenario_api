@@ -61,6 +61,65 @@ def load_from_supabase() -> pd.DataFrame:
     return df
 
 
+# ─── Data hygiene ─────────────────────────────────────────────────────────────
+
+# A pitch is uniquely identified within a game by this triplet.
+NATURAL_KEY = ["game_pk", "at_bat_number", "pitch_number"]
+
+
+def clean_pitch_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Data-hygiene pass that must run before feature engineering.
+
+    Two problems this guards against (diagnosed May 2026):
+
+      1. The 2024 season was ingested twice — once from a source carrying
+         plate_x/plate_z and once without. Exactly half of all 2024 rows
+         therefore have null coordinates, and each null row is an exact
+         duplicate (on game_pk + at_bat_number + pitch_number) of a
+         coordinate-bearing row. Confirmed: 686,824 duplicate pairs, zero
+         singletons, zero over-duplication.
+
+      2. The old pipeline filled missing coordinates with the center of the
+         zone (0.0, 2.5 → middle_middle), silently relabeling every untracked
+         pitch as a middle-middle strike — polluting loc_middle_middle and,
+         because duplicates also inflated cumcount() and the expanding
+         pitcher-tendency means, corrupting those features too.
+
+    Fix: require real coordinates (never fabricate a location), then
+    de-duplicate on the natural pitch key, keeping the coordinate-bearing copy.
+    """
+    start = len(df)
+    print("🧹 Cleaning pitch data ...")
+
+    # 1. Require real pitch coordinates — never fill to center-of-zone.
+    df["plate_x"] = pd.to_numeric(df["plate_x"], errors="coerce")
+    df["plate_z"] = pd.to_numeric(df["plate_z"], errors="coerce")
+    has_coords = df["plate_x"].notna() & df["plate_z"].notna()
+    n_no_coords = int((~has_coords).sum())
+    df = df[has_coords].copy()
+    print(f"   • Dropped {n_no_coords:,} rows missing pitch coordinates")
+
+    # 2. De-duplicate on the natural pitch key. After the coordinate filter the
+    #    null-coordinate duplicates are already gone; this also catches any
+    #    other accidental repeats. Every surviving row has coordinates, so
+    #    keep="first" is safe.
+    missing_key = [c for c in NATURAL_KEY if c not in df.columns]
+    if missing_key:
+        print(f"   • ⚠️  Skipping dedupe — missing key column(s): {missing_key}")
+    else:
+        before = len(df)
+        df = (
+            df.sort_values(NATURAL_KEY)
+              .drop_duplicates(subset=NATURAL_KEY, keep="first")
+              .reset_index(drop=True)
+        )
+        print(f"   • Removed {before - len(df):,} duplicate pitch rows")
+
+    print(f"   ✅ {start:,} → {len(df):,} clean pitches\n")
+    return df
+
+
 # ─── Location zone helper ────────────────────────────────────────────────────
 
 def get_location_zone(plate_x: float, plate_z: float, stand: str) -> str:
@@ -179,8 +238,16 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["pitcher_tired"] = (df["pitcher_pitch_count"] > 80).astype(int)
 
     # ── Pitch location zones ──────────────────────────────────────────────
-    df["plate_x"] = pd.to_numeric(df["plate_x"], errors="coerce").fillna(0.0)
-    df["plate_z"] = pd.to_numeric(df["plate_z"], errors="coerce").fillna(2.5)
+    # Coordinates are cleaned in clean_pitch_data(). Coerce defensively, but
+    # NEVER fill missing coords with the center of the zone — that silently
+    # mislabels untracked pitches as middle_middle. Drop any stragglers.
+    df["plate_x"] = pd.to_numeric(df["plate_x"], errors="coerce")
+    df["plate_z"] = pd.to_numeric(df["plate_z"], errors="coerce")
+    _missing = df["plate_x"].isna() | df["plate_z"].isna()
+    if _missing.any():
+        print(f"   ⚠️  Dropping {int(_missing.sum()):,} rows with unusable coordinates "
+              f"(did clean_pitch_data run?)")
+        df = df[~_missing].reset_index(drop=True)
 
     df["location_zone"] = df.apply(
         lambda row: get_location_zone(row["plate_x"], row["plate_z"], row["stand"]),
@@ -298,6 +365,7 @@ def train(X_train, y_train, num_classes, le):
 
 if __name__ == "__main__":
     df = load_from_supabase()
+    df = clean_pitch_data(df)
     df = engineer_features(df)
 
     # Chronological split — never let future games leak into training
