@@ -672,3 +672,60 @@ class TestEvaluateEndpoint:
         r = client.post("/api/v1/evaluate", json=payload)
         assert r.status_code == 200, r.text
         assert r.json()["outcome"]["result"] == "walk"
+
+    # ── Arsenal ──────────────────────────────────────────────────────────────
+
+    def test_no_arsenal_is_backward_compatible(self, client):
+        # Omitting arsenal = full arsenal. All 8 pitches in the distribution,
+        # and no pro tip (the top pick is always available).
+        body = client.post("/api/v1/evaluate", json=self._payload()).json()
+        assert len(body["evaluation"]["probabilities"]) == 8
+        assert body["feedback"]["pro_pitch"] is None
+        assert body["feedback"]["pro_tip"] is None
+
+    def test_arsenal_restricts_probabilities(self, client):
+        payload = self._payload()
+        payload["selection"]["pitch_type"] = "Slider"
+        payload["context"]["arsenal"] = ["Fastball", "Slider", "Changeup"]
+        body = client.post("/api/v1/evaluate", json=payload).json()
+        ev = body["evaluation"]
+        returned = {p["pitch_type"] for p in ev["probabilities"]}
+        assert returned == {"Fastball", "Slider", "Changeup"}
+        # Renormalized to sum to 1 across the arsenal.
+        assert sum(p["probability"] for p in ev["probabilities"]) == pytest.approx(1.0, abs=1e-3)
+        # Top pitch is necessarily one the player owns.
+        assert ev["top_pitch"] in {"Fastball", "Slider", "Changeup"}
+
+    def test_selected_pitch_not_in_arsenal_is_400(self, client):
+        payload = self._payload()
+        payload["selection"]["pitch_type"] = "Curveball"
+        payload["context"]["arsenal"] = ["Fastball", "Slider"]
+        r = client.post("/api/v1/evaluate", json=payload)
+        assert r.status_code == 400
+
+    def test_unknown_pitch_in_arsenal_is_400(self, client):
+        payload = self._payload()
+        payload["context"]["arsenal"] = ["Fastball", "Knuckleball"]
+        r = client.post("/api/v1/evaluate", json=payload)
+        assert r.status_code == 400
+
+    def test_pro_pick_surfaced_when_optimal_pitch_unavailable(self, client):
+        # Find a scenario where the unrestricted top pitch is NOT a fastball,
+        # then give the player a fastball-only arsenal so the pro pick differs.
+        base = self._payload()
+        base["context"].pop("arsenal", None)
+        full = client.post("/api/v1/evaluate", json=base).json()
+        unrestricted_top = full["evaluation"]["top_pitch"]
+
+        narrow = self._payload()
+        only = "Fastball" if unrestricted_top != "Fastball" else "Changeup"
+        narrow["selection"]["pitch_type"] = only
+        narrow["context"]["arsenal"] = [only]
+        body = client.post("/api/v1/evaluate", json=narrow).json()
+
+        if unrestricted_top != only:
+            assert body["feedback"]["pro_pitch"] == unrestricted_top
+            assert body["feedback"]["pro_tip"] is not None
+            assert unrestricted_top in body["feedback"]["pro_tip"]
+        # The player's grade is still relative to their (single-pitch) arsenal.
+        assert body["evaluation"]["top_pitch"] == only
