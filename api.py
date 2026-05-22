@@ -512,6 +512,14 @@ class EvaluateContext(BaseModel):
     player_id: Optional[str] = None
     # Optional seed so clients (and tests) can reproduce an outcome roll.
     random_seed: Optional[int] = None
+    # The player's available pitches this game. None = full arsenal (all types).
+    # The model still predicts over all pitch types; we mask + renormalize to
+    # this subset so quality/verdict/feedback are relative to what they can throw.
+    arsenal: Optional[list[str]] = Field(
+        None,
+        description=f"Pitches the player can throw (subset of {PITCH_CLASSES}). "
+                    f"None means the full arsenal.",
+    )
 
 
 class EvaluateRequest(BaseModel):
@@ -556,6 +564,10 @@ class FeedbackBlock(BaseModel):
     combined_assessment: str
     recommended_pitch:   Optional[str]
     coaching_hint:       Optional[str]
+    # Set only when the unrestricted model's top pitch is OUTSIDE the player's
+    # arsenal — i.e., a pro would throw something the player can't (yet) throw.
+    pro_pitch:           Optional[str] = None
+    pro_tip:             Optional[str] = None
 
 
 class SituationBlock(BaseModel):
@@ -778,6 +790,8 @@ def generate_feedback(
     sorted_probs:   list[tuple[str, float]],
     rating:         str,
     coaching_hint:  Optional[str],
+    pro_pitch:      Optional[str] = None,
+    pro_prob:       float = 0.0,
 ) -> FeedbackBlock:
     prob_map = dict(sorted_probs)
     top_pitch, top_prob = sorted_probs[0]
@@ -799,12 +813,21 @@ def generate_feedback(
 
     recommended_pitch = top_pitch if rating == "poor" else None
 
+    # "What a pro would throw" note — only when the unrestricted model favored a
+    # pitch the player doesn't have in their arsenal. Turns a gap into a tip.
+    pro_tip = None
+    if pro_pitch:
+        pro_tip = (f"A pitcher with a full arsenal might go {pro_pitch} here "
+                   f"({pro_prob * 100:.0f}%) — one to consider adding.")
+
     return FeedbackBlock(
         pitch_assessment    = pitch_assessment,
         location_assessment = location_assessment,
         combined_assessment = combined_assessment,
         recommended_pitch   = recommended_pitch,
         coaching_hint       = coaching_hint,
+        pro_pitch           = pro_pitch,
+        pro_tip             = pro_tip,
     )
 
 
@@ -1241,11 +1264,44 @@ def evaluate(req: EvaluateRequest):
             detail=f"Invalid base(s) {invalid_runners} in runners_on_base.",
         )
 
+    # Arsenal: pitches the player can throw. None/empty → full arsenal.
+    arsenal_set = set(req.context.arsenal) if req.context.arsenal else set(PITCH_CLASSES)
+    unknown_arsenal = arsenal_set - set(PITCH_CLASSES)
+    if unknown_arsenal:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown pitch(es) in arsenal: {sorted(unknown_arsenal)}. "
+                   f"Valid options: {PITCH_CLASSES}",
+        )
+    if req.selection.pitch_type not in arsenal_set:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Selected pitch '{req.selection.pitch_type}' is not in the "
+                   f"player's arsenal {sorted(arsenal_set)}.",
+        )
+
     # ── 1. Model inference (reuses /predict's feature pipeline) ─────────────
     pitch_request = _scenario_to_pitch_request(req.scenario, req.selection)
     X = build_feature_row(pitch_request)
     probs_arr = model.predict_proba(X)[0]
-    prob_map = dict(zip(PITCH_CLASSES, probs_arr))
+    full_prob_map = dict(zip(PITCH_CLASSES, probs_arr))
+    full_top_pitch = max(full_prob_map, key=full_prob_map.get)
+
+    # Condition the distribution on the arsenal: drop unavailable pitches and
+    # renormalize so quality/verdict/feedback are relative to what the player
+    # can actually throw. (No retrain needed — see arsenal design discussion.)
+    masked = {p: v for p, v in full_prob_map.items() if p in arsenal_set}
+    total = sum(masked.values())
+    if total > 0:
+        prob_map = {p: v / total for p, v in masked.items()}
+    else:
+        prob_map = {p: 1.0 / len(masked) for p in masked}  # uniform fallback
+
+    # "Pro pick": the unrestricted top pitch, surfaced only when the player
+    # doesn't have it in their arsenal.
+    pro_pitch = full_top_pitch if full_top_pitch not in arsenal_set else None
+    pro_prob  = float(full_prob_map[full_top_pitch]) if pro_pitch else 0.0
+
     sorted_probs = sorted(prob_map.items(), key=lambda x: x[1], reverse=True)
     top_pitch, top_prob = sorted_probs[0]
     selected_prob = float(prob_map.get(req.selection.pitch_type, 0.0))
@@ -1302,6 +1358,8 @@ def evaluate(req: EvaluateRequest):
         sorted_probs  = sorted_probs,
         rating        = rating,
         coaching_hint = coaching_hint,
+        pro_pitch     = pro_pitch,
+        pro_prob      = pro_prob,
     )
 
     # ── 8. Assemble response ────────────────────────────────────────────────
