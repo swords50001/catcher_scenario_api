@@ -88,6 +88,18 @@ class PitchRequest(BaseModel):
     pitcher_pitch_count: int = Field(50, ge=1,  le=150)
     same_hand:           int = Field(0,  ge=0,  le=1, description="1 if pitcher/batter same hand")
 
+    # Pitcher tendency features — fraction of pitches historically thrown of each type.
+    # Defaults to 0.125 (uniform prior, matching the training fallback).
+    # Pass the pitcher's actual season mix when available for much better predictions.
+    pitcher_tends_Fastball:  float = Field(0.125, ge=0.0, le=1.0)
+    pitcher_tends_Sinker:    float = Field(0.125, ge=0.0, le=1.0)
+    pitcher_tends_Slider:    float = Field(0.125, ge=0.0, le=1.0)
+    pitcher_tends_Changeup:  float = Field(0.125, ge=0.0, le=1.0)
+    pitcher_tends_Curveball: float = Field(0.125, ge=0.0, le=1.0)
+    pitcher_tends_Cutter:    float = Field(0.125, ge=0.0, le=1.0)
+    pitcher_tends_Splitter:  float = Field(0.125, ge=0.0, le=1.0)
+    pitcher_tends_Sweeper:   float = Field(0.125, ge=0.0, le=1.0)
+
     # Pitch location zone
     location_zone: Optional[str] = Field(
         None,
@@ -238,6 +250,15 @@ def build_feature_row(req: PitchRequest) -> pd.DataFrame:
         "batter_avg":          req.batter_avg,
         "pitcher_pitch_count": req.pitcher_pitch_count,
         "pitcher_tired":       int(req.pitcher_pitch_count > 80),
+        # Pitcher tendencies — use caller-supplied values (default 0.125 = uniform prior)
+        "pitcher_tends_Fastball":  req.pitcher_tends_Fastball,
+        "pitcher_tends_Sinker":    req.pitcher_tends_Sinker,
+        "pitcher_tends_Slider":    req.pitcher_tends_Slider,
+        "pitcher_tends_Changeup":  req.pitcher_tends_Changeup,
+        "pitcher_tends_Curveball": req.pitcher_tends_Curveball,
+        "pitcher_tends_Cutter":    req.pitcher_tends_Cutter,
+        "pitcher_tends_Splitter":  req.pitcher_tends_Splitter,
+        "pitcher_tends_Sweeper":   req.pitcher_tends_Sweeper,
     })
 
     # Count category dummy
@@ -500,6 +521,16 @@ class EvaluateScenario(BaseModel):
     score_diff:           int   = 0
     pitcher_pitch_count:  int   = Field(50, ge=1, le=150)
     previous_pitches:     list[str] = Field(default_factory=list)
+    # Pitcher tendency mix — fraction of pitches historically thrown of each type.
+    # Defaults to 0.125 (uniform prior). Pass real season mix for better predictions.
+    pitcher_tends_Fastball:  float = Field(0.125, ge=0.0, le=1.0)
+    pitcher_tends_Sinker:    float = Field(0.125, ge=0.0, le=1.0)
+    pitcher_tends_Slider:    float = Field(0.125, ge=0.0, le=1.0)
+    pitcher_tends_Changeup:  float = Field(0.125, ge=0.0, le=1.0)
+    pitcher_tends_Curveball: float = Field(0.125, ge=0.0, le=1.0)
+    pitcher_tends_Cutter:    float = Field(0.125, ge=0.0, le=1.0)
+    pitcher_tends_Splitter:  float = Field(0.125, ge=0.0, le=1.0)
+    pitcher_tends_Sweeper:   float = Field(0.125, ge=0.0, le=1.0)
 
 
 class EvaluateSelection(BaseModel):
@@ -1227,6 +1258,14 @@ def _scenario_to_pitch_request(
         same_hand           = same_hand,
         location_zone       = selection.location,
         selected_pitch      = selection.pitch_type,
+        pitcher_tends_Fastball  = scenario.pitcher_tends_Fastball,
+        pitcher_tends_Sinker    = scenario.pitcher_tends_Sinker,
+        pitcher_tends_Slider    = scenario.pitcher_tends_Slider,
+        pitcher_tends_Changeup  = scenario.pitcher_tends_Changeup,
+        pitcher_tends_Curveball = scenario.pitcher_tends_Curveball,
+        pitcher_tends_Cutter    = scenario.pitcher_tends_Cutter,
+        pitcher_tends_Splitter  = scenario.pitcher_tends_Splitter,
+        pitcher_tends_Sweeper   = scenario.pitcher_tends_Sweeper,
     )
 
 
