@@ -19,11 +19,12 @@ import joblib
 import warnings
 warnings.filterwarnings("ignore")
 
+import httpx
 import jwt as pyjwt
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -74,13 +75,46 @@ app.add_middleware(
 
 # ─── Auth ────────────────────────────────────────────────────────────────────
 
-JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
-_bearer = HTTPBearer()
+SUPABASE_URL      = os.getenv("SUPABASE_URL", "")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+JWT_SECRET        = os.getenv("SUPABASE_JWT_SECRET", "")
+_bearer           = HTTPBearer()
 
+# ── Auth request schemas ──────────────────────────────────────────────────────
+
+class SignUpRequest(BaseModel):
+    email:    str
+    password: str
+
+class SignInRequest(BaseModel):
+    email:    str
+    password: str
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+# ── Auth helpers ──────────────────────────────────────────────────────────────
+
+def _supabase_auth_headers() -> dict:
+    if not SUPABASE_ANON_KEY:
+        raise HTTPException(status_code=500, detail="SUPABASE_ANON_KEY not configured")
+    return {"apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json"}
+
+def _forward_supabase_response(resp: httpx.Response):
+    """Re-raise Supabase error responses as FastAPI HTTPExceptions."""
+    if resp.status_code >= 400:
+        try:
+            detail = resp.json()
+        except Exception:
+            detail = resp.text
+        raise HTTPException(status_code=resp.status_code, detail=detail)
+    return resp.json()
+
+# ── Auth dependency ───────────────────────────────────────────────────────────
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(_bearer)):
     if not JWT_SECRET:
-        raise HTTPException(status_code=500, detail="Server auth not configured")
+        raise HTTPException(status_code=500, detail="SUPABASE_JWT_SECRET not configured")
     try:
         payload = pyjwt.decode(
             credentials.credentials,
@@ -329,6 +363,52 @@ def me(user=Depends(get_current_user)):
         "email":   user.get("email"),
         "role":    user.get("role"),
     }
+
+
+@app.post("/auth/signup")
+def sign_up(body: SignUpRequest):
+    """
+    Create a new user account via Supabase Auth.
+
+    Returns access_token, refresh_token, and expires_in on success.
+    Supabase may require email confirmation depending on your project settings.
+    """
+    resp = httpx.post(
+        f"{SUPABASE_URL}/auth/v1/signup",
+        headers=_supabase_auth_headers(),
+        json={"email": body.email, "password": body.password},
+    )
+    return _forward_supabase_response(resp)
+
+
+@app.post("/auth/signin")
+def sign_in(body: SignInRequest):
+    """
+    Sign in with email and password via Supabase Auth.
+
+    Returns access_token, refresh_token, and expires_in on success.
+    """
+    resp = httpx.post(
+        f"{SUPABASE_URL}/auth/v1/token?grant_type=password",
+        headers=_supabase_auth_headers(),
+        json={"email": body.email, "password": body.password},
+    )
+    return _forward_supabase_response(resp)
+
+
+@app.post("/auth/refresh")
+def refresh(body: RefreshRequest):
+    """
+    Exchange a refresh_token for a new access_token.
+
+    Call this before the access_token expires (check expires_in from sign-in).
+    """
+    resp = httpx.post(
+        f"{SUPABASE_URL}/auth/v1/token?grant_type=refresh_token",
+        headers=_supabase_auth_headers(),
+        json={"refresh_token": body.refresh_token},
+    )
+    return _forward_supabase_response(resp)
 
 
 @app.get("/pitch-types")
