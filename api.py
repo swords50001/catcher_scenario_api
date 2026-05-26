@@ -19,12 +19,17 @@ import joblib
 import warnings
 warnings.filterwarnings("ignore")
 
+import jwt as pyjwt
 import pandas as pd
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from typing import Optional, Literal
+
+load_dotenv()
 
 # ─── Load model artifacts (trained by train.py) ─────────────────────────────
 MODEL_PATH    = "pitch_model.joblib"
@@ -57,12 +62,37 @@ app = FastAPI(
     version="2.0.0",
 )
 
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "*")
+ALLOWED_ORIGINS = ["*"] if _raw_origins == "*" else [o.strip() for o in _raw_origins.split(",")]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ─── Auth ────────────────────────────────────────────────────────────────────
+
+JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
+_bearer = HTTPBearer()
+
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(_bearer)):
+    if not JWT_SECRET:
+        raise HTTPException(status_code=500, detail="Server auth not configured")
+    try:
+        payload = pyjwt.decode(
+            credentials.credentials,
+            JWT_SECRET,
+            algorithms=["HS256"],
+            audience="authenticated",
+        )
+        return payload
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except pyjwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 
 # ─── Request / Response schemas ─────────────────────────────────────────────
@@ -291,6 +321,16 @@ def root():
     }
 
 
+@app.get("/auth/me")
+def me(user=Depends(get_current_user)):
+    """Returns the authenticated user's identity from their Supabase JWT."""
+    return {
+        "user_id": user.get("sub"),
+        "email":   user.get("email"),
+        "role":    user.get("role"),
+    }
+
+
 @app.get("/pitch-types")
 def get_pitch_types():
     """Return pitch types and location zones the model knows about."""
@@ -301,7 +341,7 @@ def get_pitch_types():
 
 
 @app.post("/predict", response_model=PredictResponse)
-def predict(req: PitchRequest):
+def predict(req: PitchRequest, _user=Depends(get_current_user)):
     """
     Main prediction endpoint.
 
@@ -1272,7 +1312,7 @@ def _scenario_to_pitch_request(
 # ─── /api/v1/evaluate ───────────────────────────────────────────────────────
 
 @app.post("/api/v1/evaluate", response_model=EvaluateResponse)
-def evaluate(req: EvaluateRequest):
+def evaluate(req: EvaluateRequest, _user=Depends(get_current_user)):
     """
     Server-authoritative pitch evaluation.
 
