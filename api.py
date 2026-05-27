@@ -355,6 +355,21 @@ def root():
     }
 
 
+@app.get("/.well-known/apple-app-site-association")
+async def apple_app_site_association():
+    return {
+        "applinks": {
+            "apps": [],
+            "details": [
+                {
+                    "appID": "77E57ANHXG.com.predictivesports.PitchIQ",
+                    "paths": ["/auth/callback"]
+                }
+            ]
+        }
+    }
+
+
 @app.get("/auth/me")
 def me(user=Depends(get_current_user)):
     """Returns the authenticated user's identity from their Supabase JWT."""
