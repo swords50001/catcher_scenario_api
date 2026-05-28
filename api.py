@@ -16,15 +16,19 @@ import os
 import math
 import random
 import joblib
+import smtplib
 import warnings
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 warnings.filterwarnings("ignore")
 
 import httpx
 import jwt as pyjwt
+from jwt.algorithms import ECAlgorithm
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -77,7 +81,40 @@ app.add_middleware(
 
 SUPABASE_URL      = os.getenv("SUPABASE_URL", "")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
-JWT_SECRET        = os.getenv("SUPABASE_JWT_SECRET", "")
+HOOK_SECRET       = os.getenv("HOOK_SECRET", "")
+
+# ── JWKS public-key cache ─────────────────────────────────────────────────────
+# Keys are fetched once from Supabase on first use, then cached in memory.
+# If verification fails with a cached key (e.g. after a key rotation) the cache
+# is cleared and the keys are re-fetched exactly once before giving up.
+_jwks_cache: dict[str, object] = {}   # kid → public key object
+
+def _fetch_jwks() -> dict[str, object]:
+    """Fetch and parse the JWKS from Supabase, returning a {kid: public_key} map."""
+    if not SUPABASE_URL:
+        raise HTTPException(status_code=500, detail="SUPABASE_URL is not configured")
+    jwks_url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/.well-known/jwks.json"
+    resp = httpx.get(jwks_url, timeout=5)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=500, detail="Failed to fetch JWKS from Supabase")
+    keys = {}
+    for jwk in resp.json().get("keys", []):
+        kid = jwk.get("kid", "default")
+        keys[kid] = ECAlgorithm.from_jwk(jwk)
+    return keys
+
+def _get_public_key(kid: str | None) -> object:
+    """Return the cached public key for `kid`, fetching if not yet loaded."""
+    global _jwks_cache
+    if not _jwks_cache:
+        _jwks_cache = _fetch_jwks()
+    lookup = kid or next(iter(_jwks_cache))   # fall back to first key if no kid
+    return _jwks_cache.get(lookup)
+SMTP_HOST         = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT         = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER         = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD     = os.getenv("SMTP_PASSWORD", "")
+EMAIL_FROM        = os.getenv("EMAIL_FROM", SMTP_USER)
 _bearer           = HTTPBearer()
 
 # ── Auth request schemas ──────────────────────────────────────────────────────
@@ -113,20 +150,41 @@ def _forward_supabase_response(resp: httpx.Response):
 # ── Auth dependency ───────────────────────────────────────────────────────────
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(_bearer)):
-    if not JWT_SECRET:
-        raise HTTPException(status_code=500, detail="SUPABASE_JWT_SECRET not configured")
+    token = credentials.credentials
+
+    # Read kid from the unverified header to select the right public key.
     try:
-        payload = pyjwt.decode(
-            credentials.credentials,
-            JWT_SECRET,
-            algorithms=["HS256"],
+        header = pyjwt.get_unverified_header(token)
+    except pyjwt.DecodeError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    kid = header.get("kid")
+
+    def _decode(token: str) -> dict:
+        public_key = _get_public_key(kid)
+        if public_key is None:
+            raise pyjwt.InvalidTokenError("Unknown key id")
+        return pyjwt.decode(
+            token,
+            public_key,
+            algorithms=["ES256"],
             audience="authenticated",
         )
-        return payload
+
+    try:
+        return _decode(token)
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except pyjwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        # Key may have rotated — clear cache and retry once.
+        global _jwks_cache
+        _jwks_cache = {}
+        try:
+            return _decode(token)
+        except pyjwt.ExpiredSignatureError:
+            raise HTTPException(status_code=401, detail="Token expired")
+        except pyjwt.InvalidTokenError:
+            raise HTTPException(status_code=401, detail="Invalid token")
 
 
 # ─── Request / Response schemas ─────────────────────────────────────────────
@@ -368,6 +426,123 @@ async def apple_app_site_association():
             ]
         }
     }
+
+
+# ─── Send Email Hook ─────────────────────────────────────────────────────────
+
+# Email templates keyed by Supabase's email_action_type value.
+_EMAIL_TEMPLATES: dict[str, dict] = {
+    "signup": {
+        "subject": "Confirm your PitchIQ account",
+        "html": """\
+<p>Welcome to PitchIQ! Please confirm your email address by clicking the link below.</p>
+<p><a href="{confirm_url}">Confirm your account</a></p>
+<p>If you didn't create an account, you can safely ignore this email.</p>
+""",
+    },
+    "recovery": {
+        "subject": "Reset your PitchIQ password",
+        "html": """\
+<p>We received a request to reset your PitchIQ password.</p>
+<p><a href="{confirm_url}">Reset your password</a></p>
+<p>This link expires in 1 hour. If you didn't request a reset, ignore this email.</p>
+""",
+    },
+    "magiclink": {
+        "subject": "Your PitchIQ sign-in link",
+        "html": """\
+<p>Click the link below to sign in to PitchIQ. The link expires in 10 minutes.</p>
+<p><a href="{confirm_url}">Sign in to PitchIQ</a></p>
+<p>If you didn't request this, ignore this email.</p>
+""",
+    },
+    "invite": {
+        "subject": "You've been invited to PitchIQ",
+        "html": """\
+<p>You've been invited to join PitchIQ. Click the link below to accept your invitation
+and set your password.</p>
+<p><a href="{confirm_url}">Accept invitation</a></p>
+""",
+    },
+    "email_change": {
+        "subject": "Confirm your new PitchIQ email address",
+        "html": """\
+<p>Click the link below to confirm this as your new email address on PitchIQ.</p>
+<p><a href="{confirm_url}">Confirm new email</a></p>
+<p>If you didn't request this change, please contact support immediately.</p>
+""",
+    },
+}
+
+_DEFAULT_TEMPLATE = {
+    "subject": "PitchIQ — action required",
+    "html": '<p>Please complete your request by clicking <a href="{confirm_url}">here</a>.</p>',
+}
+
+
+def _build_confirm_url(event: dict) -> str:
+    """Reconstruct the Supabase confirmation URL from hook payload fields."""
+    email_data  = event.get("email_data", {})
+    site_url    = email_data.get("site_url", "").rstrip("/")
+    redirect_to = email_data.get("redirect_to", "")
+    token_hash  = email_data.get("token_hash", "")
+    action_type = email_data.get("email_action_type", "")
+
+    # Supabase's standard confirmation URL format
+    url = f"{site_url}/auth/v1/verify?token={token_hash}&type={action_type}"
+    if redirect_to:
+        url += f"&redirect_to={redirect_to}"
+    return url
+
+
+def _send_smtp_email(to_address: str, subject: str, html_body: str) -> None:
+    """Send a single HTML email via SMTP."""
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = EMAIL_FROM
+    msg["To"]      = to_address
+    msg.attach(MIMEText(html_body, "html"))
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.ehlo()
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.sendmail(EMAIL_FROM, to_address, msg.as_string())
+
+
+@app.post("/hooks/send-email", status_code=200)
+async def send_email_hook(request: Request):
+    """
+    Receives Supabase's Send Email hook and delivers the email via SMTP.
+
+    Configure in Supabase dashboard → Authentication → Hooks → Send Email.
+    Set HOOK_SECRET in your .env to match the secret stored in the database as
+    app.hook_secret. Supabase will pass it as a Bearer token.
+    """
+    # ── Verify shared secret ────────────────────────────────────────────────
+    auth_header = request.headers.get("Authorization", "")
+    if not HOOK_SECRET or auth_header != f"Bearer {HOOK_SECRET}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    event = await request.json()
+
+    to_email    = event.get("user", {}).get("email") or event.get("email")
+    action_type = event.get("email_data", {}).get("email_action_type", "")
+
+    if not to_email:
+        raise HTTPException(status_code=400, detail="No recipient email in payload")
+
+    template    = _EMAIL_TEMPLATES.get(action_type, _DEFAULT_TEMPLATE)
+    confirm_url = _build_confirm_url(event)
+    html_body   = template["html"].format(confirm_url=confirm_url)
+
+    try:
+        _send_smtp_email(to_email, template["subject"], html_body)
+    except Exception as exc:
+        # Log and return 500 — Supabase will fall back to its built-in mailer.
+        raise HTTPException(status_code=500, detail=f"SMTP error: {exc}")
+
+    return {"success": True}
 
 
 @app.get("/auth/me")
