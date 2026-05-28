@@ -362,7 +362,7 @@ async def apple_app_site_association():
             "apps": [],
             "details": [
                 {
-                    "appID": "77E57ANHXG.com.predictivesports.PitchIQ",
+                    "appID": "77E57ANHXG.com.predictivesports.pitchiq",
                     "paths": ["/auth/callback"]
                 }
             ]
